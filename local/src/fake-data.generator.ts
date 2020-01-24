@@ -19,7 +19,7 @@ export interface Product {
   department: string;
 }
 
-async function generateProducts(count = 100) {
+async function generateProducts(count = 1000) {
   const products = [];
   for (let i = 0; i <= count; i++) {
     const product: Product = {
@@ -30,16 +30,17 @@ async function generateProducts(count = 100) {
       price: faker.random.number(700)
     };
     const ref = await db.collection("products").add(product);
+    console.log(`product ${ref.id} added`);
     products.push({ ...product, id: ref.id });
   }
   return products;
 }
 
-function generateRows(orderId: string, products: Product[], count = 100) {
+function generateRows(orderId: string, products: Product[], count = 1000) {
   const customerDetails = faker.helpers.createCard();
   const rows = [];
-  const product = faker.random.arrayElement(products);
   for (let i = 0; i <= count; i++) {
+    const product = faker.random.arrayElement(products);
     const row = {
       customer: { ...customerDetails },
       productId: product.id,
@@ -58,7 +59,10 @@ async function createRows() {
   const generatedRows = generateRows("abcd1234", generatedProducts);
 
   for (const row of generatedRows) {
-    await db.collection("rows").add(row);
+    await db
+      .collection("rows")
+      .add(row)
+      .then(ref => console.log(`row ${ref.id} added`));
   }
 }
 

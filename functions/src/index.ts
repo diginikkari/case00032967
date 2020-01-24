@@ -1,8 +1,9 @@
 import * as firebaseFunctions from "firebase-functions";
 
 import * as admin from "firebase-admin";
-import { Product } from "./fake-data.generator";
+import { DocumentSnapshot } from "firebase-functions/lib/providers/firestore";
 
+admin.initializeApp();
 // let db: FirebaseFirestore.Firestore;
 
 // Set functions region to be in europe
@@ -11,8 +12,8 @@ const functions = firebaseFunctions.region("europe-west1");
 export const createOrder = functions.firestore
   .document("/orders/{orderId}")
   .onCreate(async (snapshot, context) => {
-    admin.initializeApp();
     try {
+      const promises: Promise<any>[] = [];
       const order = snapshot.data() as { copyOf?: string };
       if (order.copyOf) {
         console.info("Started copying salesorder rows");
@@ -25,8 +26,10 @@ export const createOrder = functions.firestore
         const targetOrderId = snapshot.id;
         console.log(`copy rows from ${sourceOrderId} to ${targetOrderId}`);
         await copyRows(sourceOrderId, targetOrderId);
-        await calculateTotals(snapshot.id);
-        await updateProductCounts(snapshot.id);
+        console.log("all rows copied");
+        promises.push(calculateTotals(snapshot.id));
+        promises.push(updateProductCounts(snapshot.id));
+        await Promise.all(promises);
         await snapshot.ref.update({
           copyOf: admin.firestore.FieldValue.delete()
         });
@@ -40,58 +43,123 @@ export const createOrder = functions.firestore
 
 async function copyRows(sourceOrderId: string, targetOrderId: string) {
   const db = admin.firestore();
-  const rowQuerySnapshot = await db
+  let count = 0;
+  let query = db
     .collection("rows")
     .where("orderId", "==", sourceOrderId)
-    .get();
-  for (const doc of rowQuerySnapshot.docs) {
-    const row = doc.data();
-    row.orderId = targetOrderId;
-    const newRowRef = await db.collection("rows").add(row);
-    console.log("row copied", newRowRef.id);
+    .limit(100);
+
+  let rowQuerySnapshot = await query.get();
+
+  while (rowQuerySnapshot.size) {
+    let lastItem: DocumentSnapshot | undefined;
+    let batch = db.batch();
+    for (const doc of rowQuerySnapshot.docs) {
+      count++;
+      lastItem = doc;
+      const row = doc.data();
+      row.orderId = targetOrderId;
+      batch.create(db.collection("rows").doc(), row);
+    }
+    console.log(`batch writing first ${count} items`);
+    await batch.commit();
+    batch = db.batch();
+    lastItem = rowQuerySnapshot.docs.pop();
+    if (lastItem) {
+      query = query.startAfter(lastItem);
+      rowQuerySnapshot = await query.get();
+    }
   }
-  return true;
+  console.log("All rows are copied");
 }
 
 async function updateProductCounts(orderId: string) {
+  console.log("calculating product counts");
+  const promises = [];
+  let rowCount = 0;
   const db = admin.firestore();
-  const rowQuerySnapshot = await db
+  let query = db
     .collection("rows")
     .where("orderId", "==", orderId)
-    .get();
+    .limit(100);
 
-  for (const doc of rowQuerySnapshot.docs) {
-    const row = doc.data();
-    const productDoc = await db
-      .collection("products")
-      .doc(row.productId)
-      .get();
-    const product = productDoc.data() as Product;
-    const productRows = await db
-      .collection("rows")
-      .where("productId", "==", row.productId)
-      .get();
-    let count = 0;
-    for (const rowDoc of productRows.docs) {
-      const productRow = rowDoc.data();
-      count += productRow.quantity;
+  let rowQuerySnapshot = await query.get();
+  const processedProducts = {} as { [productId: string]: boolean };
+
+  while (rowQuerySnapshot.size) {
+    let lastItem: DocumentSnapshot | undefined;
+
+    for (const doc of rowQuerySnapshot.docs) {
+      rowCount++;
+      const row = doc.data();
+      console.log(`processing row no ${rowCount} id ${doc.id}`);
+      if (!processedProducts[row.productId]) {
+        const productDoc = await db
+          .collection("products")
+          .doc(row.productId)
+          .get();
+        const product = productDoc.data() as { price: number };
+        const productRows = await db
+          .collection("rows")
+          .where("productId", "==", row.productId)
+          .get();
+        let count = 0;
+        for (const rowDoc of productRows.docs) {
+          const productRow = rowDoc.data();
+          count += productRow.quantity;
+        }
+        const totalSales = count * product.price;
+        console.log(
+          `Updating total sales for product ${productDoc.id} to ${totalSales}`
+        );
+        promises.push(
+          productDoc.ref.update({
+            count,
+            totalSales: totalSales
+          })
+        );
+        processedProducts[row.productId] = true;
+      } else {
+        console.log(`product ${row.productId} already processed.`);
+      }
     }
-    await productDoc.ref.update({ count, totalSales: count * product.price });
+
+    lastItem = rowQuerySnapshot.docs.pop();
+    console.log("batch processed");
+    if (lastItem) {
+      query = query.startAfter(lastItem);
+      rowQuerySnapshot = await query.get();
+    }
   }
-  return true;
+  return Promise.all(promises);
 }
 
 async function calculateTotals(orderId: string) {
+  console.log("calculating salesorder totals");
   const db = admin.firestore();
   let totalPrice = 0;
-  const rowQuerySnapshot = await db
+  let count = 0;
+
+  let query = db
     .collection("rows")
     .where("orderId", "==", orderId)
-    .get();
+    .limit(100);
+  let rowQuerySnapshot = await query.get();
 
-  for (const doc of rowQuerySnapshot.docs) {
-    const row = doc.data();
-    totalPrice += row.quantity * row.price;
+  while (rowQuerySnapshot.size) {
+    let lastItem: DocumentSnapshot | undefined;
+    for (const doc of rowQuerySnapshot.docs) {
+      count++;
+      console.log(`counting row no: ${count} id: ${doc.id}`);
+      const row = doc.data();
+      totalPrice += row.quantity * row.price;
+    }
+    lastItem = rowQuerySnapshot.docs.pop();
+    console.log("counted batch");
+    if (lastItem) {
+      query = query.startAfter(lastItem);
+      rowQuerySnapshot = await query.get();
+    }
   }
 
   return db
